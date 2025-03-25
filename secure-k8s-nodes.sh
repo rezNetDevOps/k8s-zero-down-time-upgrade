@@ -12,10 +12,11 @@ MAX_CONCURRENT_UPGRADES=1 # Maximum nodes to upgrade concurrently
 WORKER_DRAIN_TIMEOUT="300s" # Time to wait for pods to evict during drain
 LOG_FILE="k8s-security-upgrade-$(date +%Y%m%d-%H%M%S).log"
 BACKUP_DIR="security-upgrade-backup-$(date +%Y%m%d)"
-ADMIN_USER="admin"
+ADMIN_USER="inteladmin"
 SSH_KEY_PATH=""
 INVENTORY_PATH="./cloud/hetzner/kubespray/inventory.ini"
 K8S_UPGRADE=true
+ROOT_SSH_KEY="$HOME/.ssh/id_ed25519" # Default root SSH key path
 
 # Terminal colors
 RED='\033[0;31m'
@@ -28,13 +29,14 @@ NC='\033[0m' # No Color
 usage() {
   echo "Usage: $0 [options]"
   echo "Options:"
-  echo "  -u, --user USERNAME       Admin username to create (default: admin)"
+  echo "  -u, --user USERNAME       Admin username to create (default: inteladmin)"
   echo "  -i, --inventory PATH      Path to inventory.ini file (default: ./cloud/hetzner/kubespray/inventory.ini)"
   echo "  -k, --k8s-upgrade BOOL    Enable/disable Kubernetes upgrade (default: true)"
+  echo "  -s, --ssh-key PATH        Path to root SSH key for node access (default: $HOME/.ssh/id_ed25519)"
   echo "  -h, --help                Display this help message"
   echo ""
   echo "Example:"
-  echo "  $0 --user admin2023 --inventory /path/to/inventory.ini --k8s-upgrade false"
+  echo "  $0 --user admin2023 --inventory /path/to/inventory.ini --k8s-upgrade false --ssh-key $HOME/.ssh/id_ed25519"
   exit 1
 }
 
@@ -54,6 +56,10 @@ parse_args() {
         K8S_UPGRADE="$2"
         shift 2
         ;;
+      -s|--ssh-key)
+        ROOT_SSH_KEY="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         ;;
@@ -65,7 +71,7 @@ parse_args() {
   done
   
   # Set SSH key path based on username
-  SSH_KEY_PATH="$HOME/.ssh/${ADMIN_USER}_id_rsa"
+  SSH_KEY_PATH="$HOME/.ssh/${ADMIN_USER}_id_ed25519"
   
   # Validate k8s-upgrade parameter
   if [[ "$K8S_UPGRADE" != "true" && "$K8S_UPGRADE" != "false" ]]; then
@@ -73,10 +79,18 @@ parse_args() {
     usage
   fi
   
+  # Verify root SSH key exists
+  if [ ! -f "$ROOT_SSH_KEY" ]; then
+    echo "Error: Root SSH key not found at $ROOT_SSH_KEY"
+    echo "Please provide a valid SSH key path with --ssh-key"
+    usage
+  fi
+  
   # Print configuration
   echo "Configuration:"
   echo "  Admin user: $ADMIN_USER"
   echo "  SSH key path: $SSH_KEY_PATH"
+  echo "  Root SSH key: $ROOT_SSH_KEY"
   echo "  Inventory path: $INVENTORY_PATH"
   echo "  K8s upgrade: $K8S_UPGRADE"
   echo ""
@@ -132,8 +146,8 @@ create_ssh_key() {
   log "Checking for SSH key at $SSH_KEY_PATH"
   
   if [ ! -f "$SSH_KEY_PATH" ]; then
-    log "Generating new SSH key for $ADMIN_USER user"
-    ssh-keygen -t rsa -b 4096 -f "$SSH_KEY_PATH" -N "" -C "$ADMIN_USER@k8s-admin"
+    log "Generating new ED25519 SSH key for $ADMIN_USER user"
+    ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -C "$ADMIN_USER@k8s-admin"
     log_success "SSH key generated at $SSH_KEY_PATH"
   else
     log "SSH key already exists at $SSH_KEY_PATH"
@@ -150,7 +164,7 @@ setup_admin_user() {
   log "Setting up $ADMIN_USER user on $node_ip"
   
   # Connect to node as root and create admin user
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     set -e
     
     # Create user if it doesn't exist
@@ -180,7 +194,7 @@ enhance_ssh_security() {
   local node_ip=$1
   log "Enhancing SSH security on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Back up SSH config
     mkdir -p /root/security-backup
     cp /etc/ssh/sshd_config /root/security-backup/sshd_config.backup
@@ -216,7 +230,7 @@ configure_firewall() {
   local node_ip=$1
   log "Configuring firewall on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Check if ufw is installed
     if ! command -v ufw >/dev/null 2>&1; then
       apt-get update
@@ -259,7 +273,7 @@ harden_kernel_parameters() {
   local node_ip=$1
   log "Hardening kernel parameters on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Back up sysctl conf
     cp /etc/sysctl.conf /root/security-backup/sysctl.conf.backup
     
@@ -315,7 +329,7 @@ setup_auditd() {
   local node_ip=$1
   log "Setting up auditd for system auditing on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Install auditd if needed
     if ! command -v auditd >/dev/null 2>&1; then
       apt-get update
@@ -388,7 +402,7 @@ secure_root_account() {
   local node_ip=$1
   log "Securing root account on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Set strong password policies
     if command -v pwquality >/dev/null 2>&1; then
       # Backup first
@@ -412,7 +426,7 @@ install_fail2ban() {
   local node_ip=$1
   log "Installing and configuring Fail2ban on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Install fail2ban
     apt-get update
     apt-get install -y fail2ban
@@ -446,7 +460,7 @@ secure_containerd() {
   local node_ip=$1
   log "Securing containerd runtime on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Backup containerd config
     if [ -f /etc/containerd/config.toml ]; then
       cp /etc/containerd/config.toml /root/security-backup/config.toml.backup
@@ -491,7 +505,7 @@ update_system() {
   local node_ip=$1
   log "Updating system packages on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip bash -c "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
     # Update package lists
     apt-get update
     
@@ -542,7 +556,7 @@ verify_node_health() {
   
   # Check if kubelet is running
   local node_ip=$(grep $node $INVENTORY_PATH | grep -oP 'ansible_host=\K[^ ]+')
-  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@$node_ip systemctl is-active kubelet
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip systemctl is-active kubelet
   
   log_success "Node ${node} is healthy"
   return 0
