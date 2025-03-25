@@ -12,7 +12,7 @@ MAX_CONCURRENT_UPGRADES=1 # Maximum nodes to upgrade concurrently
 WORKER_DRAIN_TIMEOUT="300s" # Time to wait for pods to evict during drain
 LOG_FILE="k8s-security-upgrade-$(date +%Y%m%d-%H%M%S).log"
 BACKUP_DIR="security-upgrade-backup-$(date +%Y%m%d)"
-ADMIN_USER="inteladmin"
+ADMIN_USER="admin"
 SSH_KEY_PATH=""
 INVENTORY_PATH="./cloud/hetzner/kubespray/inventory.ini"
 K8S_UPGRADE=true
@@ -29,7 +29,7 @@ NC='\033[0m' # No Color
 usage() {
   echo "Usage: $0 [options]"
   echo "Options:"
-  echo "  -u, --user USERNAME       Admin username to create (default: inteladmin)"
+  echo "  -u, --user USERNAME       Admin username to create (default: admin)"
   echo "  -i, --inventory PATH      Path to inventory.ini file (default: ./cloud/hetzner/kubespray/inventory.ini)"
   echo "  -k, --k8s-upgrade BOOL    Enable/disable Kubernetes upgrade (default: true)"
   echo "  -s, --ssh-key PATH        Path to root SSH key for node access (default: $HOME/.ssh/id_ed25519)"
