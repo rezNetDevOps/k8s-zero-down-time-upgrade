@@ -12,7 +12,7 @@ MAX_CONCURRENT_UPGRADES=1 # Maximum nodes to upgrade concurrently
 WORKER_DRAIN_TIMEOUT="300s" # Time to wait for pods to evict during drain
 LOG_FILE="k8s-security-upgrade-$(date +%Y%m%d-%H%M%S).log"
 BACKUP_DIR="security-upgrade-backup-$(date +%Y%m%d)"
-ADMIN_USER="admin"
+ADMIN_USER="inteladmin"
 SSH_KEY_PATH=""
 INVENTORY_PATH="./cloud/hetzner/kubespray/inventory.ini"
 K8S_UPGRADE=true
@@ -29,7 +29,7 @@ NC='\033[0m' # No Color
 usage() {
   echo "Usage: $0 [options]"
   echo "Options:"
-  echo "  -u, --user USERNAME       Admin username to create (default: admin)"
+  echo "  -u, --user USERNAME       Admin username to create (default: inteladmin)"
   echo "  -i, --inventory PATH      Path to inventory.ini file (default: ./cloud/hetzner/kubespray/inventory.ini)"
   echo "  -k, --k8s-upgrade BOOL    Enable/disable Kubernetes upgrade (default: true)"
   echo "  -s, --ssh-key PATH        Path to root SSH key for node access (default: $HOME/.ssh/id_ed25519)"
@@ -163,28 +163,40 @@ setup_admin_user() {
   local node_ip=$1
   log "Setting up $ADMIN_USER user on $node_ip"
   
+  # Store public key in a temporary file
+  local tmp_pub_key=$(mktemp)
+  echo "$SSH_PUB_KEY" > "$tmp_pub_key"
+  
   # Connect to node as root and create admin user
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     set -e
     
     # Create user if it doesn't exist
     if ! id -u $ADMIN_USER >/dev/null 2>&1; then
       useradd -m -s /bin/bash $ADMIN_USER
-      echo '$ADMIN_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$ADMIN_USER
+      echo \"$ADMIN_USER ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/$ADMIN_USER
       chmod 440 /etc/sudoers.d/$ADMIN_USER
     fi
     
     # Setup SSH directory and authorized_keys
     mkdir -p /home/$ADMIN_USER/.ssh
-    echo '$SSH_PUB_KEY' > /home/$ADMIN_USER/.ssh/authorized_keys
     chmod 700 /home/$ADMIN_USER/.ssh
-    chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
-    chown -R $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
-    
-    echo 'User $ADMIN_USER setup complete'
+    chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
   "
   
-  log_success "User $ADMIN_USER setup complete on $node_ip"
+  # Copy the public key directly to the remote server
+  cat "$tmp_pub_key" | ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "cat > /home/$ADMIN_USER/.ssh/authorized_keys && chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys && chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh/authorized_keys"
+  
+  # Remove temporary file
+  rm -f "$tmp_pub_key"
+  
+  # Verify we can login with the new user and key
+  if ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 -i "$SSH_KEY_PATH" "$ADMIN_USER@$node_ip" "echo 'SSH key auth successful'"; then
+    log_success "User $ADMIN_USER setup complete on $node_ip with working SSH key authentication"
+  else
+    log_error "Failed to authenticate with SSH key for $ADMIN_USER on $node_ip"
+    exit 1
+  fi
 }
 
 # SECURITY ENHANCEMENT FUNCTIONS
@@ -194,7 +206,7 @@ enhance_ssh_security() {
   local node_ip=$1
   log "Enhancing SSH security on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     # Back up SSH config
     mkdir -p /root/security-backup
     cp /etc/ssh/sshd_config /root/security-backup/sshd_config.backup
@@ -230,7 +242,7 @@ configure_firewall() {
   local node_ip=$1
   log "Configuring firewall on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     # Check if ufw is installed
     if ! command -v ufw >/dev/null 2>&1; then
       apt-get update
@@ -273,7 +285,7 @@ harden_kernel_parameters() {
   local node_ip=$1
   log "Hardening kernel parameters on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     # Back up sysctl conf
     cp /etc/sysctl.conf /root/security-backup/sysctl.conf.backup
     
@@ -329,20 +341,9 @@ setup_auditd() {
   local node_ip=$1
   log "Setting up auditd for system auditing on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
-    # Install auditd if needed
-    if ! command -v auditd >/dev/null 2>&1; then
-      apt-get update
-      apt-get install -y auditd audispd-plugins
-    fi
-    
-    # Back up audit rules
-    if [ -f /etc/audit/rules.d/audit.rules ]; then
-      cp /etc/audit/rules.d/audit.rules /root/security-backup/audit.rules.backup
-    fi
-    
-    # Configure audit rules
-    cat > /etc/audit/rules.d/audit.rules << EOF
+  # Create temporary file with audit rules
+  local tmp_audit_rules=$(mktemp)
+  cat > "$tmp_audit_rules" << EOF
 # Delete all existing rules
 -D
 
@@ -388,12 +389,32 @@ setup_auditd() {
 # Make audit config immutable - requires reboot to change audit rules
 -e 2
 EOF
+
+  # Install auditd and setup rules
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
+    # Install auditd if needed
+    if ! command -v auditd >/dev/null 2>&1; then
+      apt-get update
+      apt-get install -y auditd audispd-plugins
+    fi
     
-    # Restart auditd
-    service auditd restart
+    # Back up audit rules
+    if [ -f /etc/audit/rules.d/audit.rules ]; then
+      cp /etc/audit/rules.d/audit.rules /root/security-backup/audit.rules.backup
+    fi
     
-    echo 'System auditing configured with auditd'
+    # Prepare directory
+    mkdir -p /etc/audit/rules.d/
   "
+  
+  # Copy the rules file to the remote server
+  cat "$tmp_audit_rules" | ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "cat > /etc/audit/rules.d/audit.rules"
+  
+  # Restart auditd
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "service auditd restart"
+  
+  # Remove temporary file
+  rm -f "$tmp_audit_rules"
   
   log_success "System auditing configured on $node_ip"
 }
@@ -402,7 +423,7 @@ secure_root_account() {
   local node_ip=$1
   log "Securing root account on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     # Set strong password policies
     if command -v pwquality >/dev/null 2>&1; then
       # Backup first
@@ -426,13 +447,9 @@ install_fail2ban() {
   local node_ip=$1
   log "Installing and configuring Fail2ban on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
-    # Install fail2ban
-    apt-get update
-    apt-get install -y fail2ban
-    
-    # Configure fail2ban for SSH
-    cat > /etc/fail2ban/jail.local << EOF
+  # Create temporary file for fail2ban config
+  local tmp_fail2ban=$(mktemp)
+  cat > "$tmp_fail2ban" << EOF
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -445,13 +462,25 @@ filter = sshd
 logpath = /var/log/auth.log
 maxretry = 3
 EOF
+
+  # Install and setup fail2ban
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
+    # Install fail2ban
+    apt-get update
+    apt-get install -y fail2ban
     
-    # Enable and start fail2ban
-    systemctl enable fail2ban
-    systemctl restart fail2ban
-    
-    echo 'Fail2ban installed and configured'
+    # Create directory if needed
+    mkdir -p /etc/fail2ban
   "
+  
+  # Copy the fail2ban config to the remote server
+  cat "$tmp_fail2ban" | ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "cat > /etc/fail2ban/jail.local"
+  
+  # Enable and start fail2ban
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "systemctl enable fail2ban && systemctl restart fail2ban"
+  
+  # Remove temporary file
+  rm -f "$tmp_fail2ban"
   
   log_success "Fail2ban installed and configured on $node_ip"
 }
@@ -460,7 +489,7 @@ secure_containerd() {
   local node_ip=$1
   log "Securing containerd runtime on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     # Backup containerd config
     if [ -f /etc/containerd/config.toml ]; then
       cp /etc/containerd/config.toml /root/security-backup/config.toml.backup
@@ -480,7 +509,7 @@ secure_containerd() {
       
       # Set no_new_privileges for default runtime
       if ! grep -q 'no_new_privileges' /etc/containerd/config.toml; then
-        sed -i '/\[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options\]/a \        NoNewPrivileges = true' /etc/containerd/config.toml
+        sed -i '/\[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options\]/a \        NoNewPrivileges = true' /etc/containerd/config.toml
       fi
     else
       # Older format or custom config - be more careful
@@ -505,7 +534,7 @@ update_system() {
   local node_ip=$1
   log "Updating system packages on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "
+  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
     # Update package lists
     apt-get update
     
