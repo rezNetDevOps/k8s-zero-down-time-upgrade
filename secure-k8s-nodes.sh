@@ -17,6 +17,7 @@ SSH_KEY_PATH=""
 INVENTORY_PATH="./cloud/hetzner/kubespray/inventory.ini"
 K8S_UPGRADE=true
 ROOT_SSH_KEY="$HOME/.ssh/id_ed25519" # Default root SSH key path
+DEBUG=false # Set to true for verbose SSH output
 
 # Terminal colors
 RED='\033[0;31m'
@@ -33,6 +34,7 @@ usage() {
   echo "  -i, --inventory PATH      Path to inventory.ini file (default: ./cloud/hetzner/kubespray/inventory.ini)"
   echo "  -k, --k8s-upgrade BOOL    Enable/disable Kubernetes upgrade (default: true)"
   echo "  -s, --ssh-key PATH        Path to root SSH key for node access (default: $HOME/.ssh/id_ed25519)"
+  echo "  -d, --debug               Enable debug mode for verbose output"
   echo "  -h, --help                Display this help message"
   echo ""
   echo "Example:"
@@ -59,6 +61,10 @@ parse_args() {
       -s|--ssh-key)
         ROOT_SSH_KEY="$2"
         shift 2
+        ;;
+      -d|--debug)
+        DEBUG=true
+        shift
         ;;
       -h|--help)
         usage
@@ -93,6 +99,7 @@ parse_args() {
   echo "  Root SSH key: $ROOT_SSH_KEY"
   echo "  Inventory path: $INVENTORY_PATH"
   echo "  K8s upgrade: $K8S_UPGRADE"
+  echo "  Debug mode: $DEBUG"
   echo ""
 }
 
@@ -158,6 +165,46 @@ create_ssh_key() {
   log "Using public key: $SSH_PUB_KEY"
 }
 
+# Run a command on remote node with error checking
+run_remote_command() {
+  local node_ip=$1
+  local command=$2
+  local description=$3
+  local error_msg=${4:-"Command failed"}
+  
+  log "Running on $node_ip: $description"
+  
+  if [ "$DEBUG" = true ]; then
+    log "Command: $command"
+  fi
+  
+  # Execute command and capture output and exit code
+  local output
+  local exit_code
+  
+  if [ "$DEBUG" = true ]; then
+    # With verbose output
+    output=$(ssh -v -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "$command" 2>&1)
+    exit_code=$?
+  else
+    # Without verbose output
+    output=$(ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "$command" 2>&1)
+    exit_code=$?
+  fi
+  
+  # Check for success
+  if [ $exit_code -ne 0 ]; then
+    log_error "$error_msg on $node_ip: $output"
+    return 1
+  fi
+  
+  if [ "$DEBUG" = true ]; then
+    log "Command output: $output"
+  fi
+  
+  return 0
+}
+
 # Setup admin user on node
 setup_admin_user() {
   local node_ip=$1
@@ -167,22 +214,14 @@ setup_admin_user() {
   local tmp_pub_key=$(mktemp)
   echo "$SSH_PUB_KEY" > "$tmp_pub_key"
   
-  # Connect to node as root and create admin user
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    set -e
-    
-    # Create user if it doesn't exist
-    if ! id -u $ADMIN_USER >/dev/null 2>&1; then
-      useradd -m -s /bin/bash $ADMIN_USER
-      echo \"$ADMIN_USER ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/$ADMIN_USER
-      chmod 440 /etc/sudoers.d/$ADMIN_USER
-    fi
-    
-    # Setup SSH directory and authorized_keys
-    mkdir -p /home/$ADMIN_USER/.ssh
-    chmod 700 /home/$ADMIN_USER/.ssh
-    chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
-  "
+  # Create user
+  run_remote_command "$node_ip" "id -u $ADMIN_USER &>/dev/null || useradd -m -s /bin/bash $ADMIN_USER" "Creating user $ADMIN_USER" "Failed to create user"
+  
+  # Setup sudo access
+  run_remote_command "$node_ip" "echo '$ADMIN_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$ADMIN_USER && chmod 440 /etc/sudoers.d/$ADMIN_USER" "Setting up sudo access" "Failed to configure sudo"
+  
+  # Setup SSH directory
+  run_remote_command "$node_ip" "mkdir -p /home/$ADMIN_USER/.ssh && chmod 700 /home/$ADMIN_USER/.ssh && chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh" "Setting up SSH directory" "Failed to setup SSH directory"
   
   # Copy the public key directly to the remote server
   cat "$tmp_pub_key" | ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "cat > /home/$ADMIN_USER/.ssh/authorized_keys && chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys && chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh/authorized_keys"
@@ -206,34 +245,27 @@ enhance_ssh_security() {
   local node_ip=$1
   log "Enhancing SSH security on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Back up SSH config
-    mkdir -p /root/security-backup
-    cp /etc/ssh/sshd_config /root/security-backup/sshd_config.backup
-    
-    # Secure SSH configuration
-    sed -i.bak \\
-      -e 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' \\
-      -e 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' \\
-      -e 's/^#\?X11Forwarding .*/X11Forwarding no/' \\
-      -e 's/^#\?MaxAuthTries .*/MaxAuthTries 3/' \\
-      -e 's/^#\?ClientAliveInterval .*/ClientAliveInterval 300/' \\
-      -e 's/^#\?ClientAliveCountMax .*/ClientAliveCountMax 2/' \\
-      -e 's/^#\?Protocol .*/Protocol 2/' \\
-      /etc/ssh/sshd_config
-    
-    # Add additional security options
-    if ! grep -q '^AllowAgentForwarding' /etc/ssh/sshd_config; then
-      echo 'AllowAgentForwarding no' >> /etc/ssh/sshd_config
-    fi
-    
-    if ! grep -q '^AllowTcpForwarding' /etc/ssh/sshd_config; then
-      echo 'AllowTcpForwarding no' >> /etc/ssh/sshd_config
-    fi
-    
-    systemctl restart sshd
-    echo 'SSH security enhanced and service restarted'
-  "
+  # Back up SSH config
+  run_remote_command "$node_ip" "mkdir -p /root/security-backup && cp /etc/ssh/sshd_config /root/security-backup/sshd_config.backup" "Backing up SSH config" "Failed to backup SSH config"
+  
+  # Apply security settings
+  local ssh_security_cmd="sed -i.bak -e 's/^#\\?PermitRootLogin .*/PermitRootLogin prohibit-password/' \
+    -e 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' \
+    -e 's/^#\\?X11Forwarding .*/X11Forwarding no/' \
+    -e 's/^#\\?MaxAuthTries .*/MaxAuthTries 3/' \
+    -e 's/^#\\?ClientAliveInterval .*/ClientAliveInterval 300/' \
+    -e 's/^#\\?ClientAliveCountMax .*/ClientAliveCountMax 2/' \
+    -e 's/^#\\?Protocol .*/Protocol 2/' /etc/ssh/sshd_config"
+  
+  run_remote_command "$node_ip" "$ssh_security_cmd" "Updating SSH config" "Failed to update SSH config"
+  
+  # Add additional security options
+  run_remote_command "$node_ip" "grep -q '^AllowAgentForwarding' /etc/ssh/sshd_config || echo 'AllowAgentForwarding no' >> /etc/ssh/sshd_config" "Configuring agent forwarding" "Failed to configure agent forwarding"
+  
+  run_remote_command "$node_ip" "grep -q '^AllowTcpForwarding' /etc/ssh/sshd_config || echo 'AllowTcpForwarding no' >> /etc/ssh/sshd_config" "Configuring TCP forwarding" "Failed to configure TCP forwarding"
+  
+  # Restart SSH service
+  run_remote_command "$node_ip" "systemctl restart sshd" "Restarting SSH service" "Failed to restart SSH service"
   
   log_success "SSH security enhanced on $node_ip"
 }
@@ -242,41 +274,34 @@ configure_firewall() {
   local node_ip=$1
   log "Configuring firewall on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Check if ufw is installed
-    if ! command -v ufw >/dev/null 2>&1; then
-      apt-get update
-      apt-get install -y ufw
-    fi
-    
-    # Configure ufw for Kubernetes
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow $SSH_PORT/tcp
-    
-    # Kubernetes required ports
-    # Control plane nodes
-    ufw allow 6443/tcp # Kubernetes API server
-    ufw allow 2379:2380/tcp # etcd server client API
-    ufw allow 10250/tcp # Kubelet API
-    ufw allow 10259/tcp # kube-scheduler
-    ufw allow 10257/tcp # kube-controller-manager
-    
-    # Worker nodes
-    ufw allow 10250/tcp # Kubelet API
-    ufw allow 30000:32767/tcp # NodePort Services
-    
-    # Cilium CNI specific ports
-    ufw allow 4240/tcp # Cilium health checks
-    ufw allow 4244/tcp # Hubble server
-    ufw allow 4245/tcp # Hubble relay
-    ufw allow 51871/udp # Cilium VXLAN tunnel
-    
-    # Enable firewall
-    ufw --force enable
-    
-    echo 'Firewall configured and enabled'
-  "
+  # Install UFW if not present
+  run_remote_command "$node_ip" "command -v ufw >/dev/null 2>&1 || (apt-get update && apt-get install -y ufw)" "Installing UFW" "Failed to install UFW"
+  
+  # Configure default UFW rules
+  run_remote_command "$node_ip" "ufw default deny incoming" "Setting UFW default incoming policy" "Failed to set UFW policy"
+  run_remote_command "$node_ip" "ufw default allow outgoing" "Setting UFW default outgoing policy" "Failed to set UFW policy"
+  
+  # Add required ports
+  run_remote_command "$node_ip" "ufw allow $SSH_PORT/tcp" "Opening SSH port" "Failed to configure UFW"
+  
+  # Kubernetes control plane ports
+  run_remote_command "$node_ip" "ufw allow 6443/tcp" "Opening Kubernetes API server port" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 2379:2380/tcp" "Opening etcd ports" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 10250/tcp" "Opening Kubelet API port" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 10259/tcp" "Opening kube-scheduler port" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 10257/tcp" "Opening kube-controller-manager port" "Failed to configure UFW"
+  
+  # Worker node ports
+  run_remote_command "$node_ip" "ufw allow 30000:32767/tcp" "Opening NodePort services range" "Failed to configure UFW"
+  
+  # Cilium CNI specific ports
+  run_remote_command "$node_ip" "ufw allow 4240/tcp" "Opening Cilium health checks port" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 4244/tcp" "Opening Hubble server port" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 4245/tcp" "Opening Hubble relay port" "Failed to configure UFW"
+  run_remote_command "$node_ip" "ufw allow 51871/udp" "Opening Cilium VXLAN tunnel port" "Failed to configure UFW"
+  
+  # Enable UFW
+  run_remote_command "$node_ip" "ufw --force enable" "Enabling UFW" "Failed to enable UFW"
   
   log_success "Firewall configured on $node_ip"
 }
@@ -285,12 +310,12 @@ harden_kernel_parameters() {
   local node_ip=$1
   log "Hardening kernel parameters on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Back up sysctl conf
-    cp /etc/sysctl.conf /root/security-backup/sysctl.conf.backup
-    
-    # Configure kernel parameters
-    cat > /etc/sysctl.d/99-kubernetes-security.conf << EOF
+  # Backup sysctl configuration
+  run_remote_command "$node_ip" "cp /etc/sysctl.conf /root/security-backup/sysctl.conf.backup" "Backing up sysctl config" "Failed to backup sysctl config"
+  
+  # Create temporary file with kernel parameters
+  local tmp_sysctl=$(mktemp)
+  cat > "$tmp_sysctl" << 'EOF'
 # IP Spoofing protection
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
@@ -327,12 +352,15 @@ net.ipv4.conf.lxc*.rp_filter = 0
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 EOF
-    
-    # Apply changes
-    sysctl --system
-    
-    echo 'Kernel parameters hardened'
-  "
+  
+  # Copy sysctl config to remote server
+  scp -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" "$tmp_sysctl" root@$node_ip:/etc/sysctl.d/99-kubernetes-security.conf
+  
+  # Apply sysctl changes
+  run_remote_command "$node_ip" "sysctl --system" "Applying kernel parameters" "Failed to apply kernel parameters"
+  
+  # Remove temporary file
+  rm -f "$tmp_sysctl"
   
   log_success "Kernel parameters hardened on $node_ip"
 }
@@ -340,6 +368,15 @@ EOF
 setup_auditd() {
   local node_ip=$1
   log "Setting up auditd for system auditing on $node_ip..."
+  
+  # Install auditd if needed
+  run_remote_command "$node_ip" "command -v auditd >/dev/null 2>&1 || (apt-get update && apt-get install -y auditd audispd-plugins)" "Installing auditd" "Failed to install auditd"
+  
+  # Backup existing rules if they exist
+  run_remote_command "$node_ip" "[ -f /etc/audit/rules.d/audit.rules ] && cp /etc/audit/rules.d/audit.rules /root/security-backup/audit.rules.backup || true" "Backing up audit rules" "Failed to backup audit rules"
+  
+  # Create directory for rules
+  run_remote_command "$node_ip" "mkdir -p /etc/audit/rules.d/" "Creating audit rules directory" "Failed to create audit rules directory"
   
   # Create temporary file with audit rules
   local tmp_audit_rules=$(mktemp)
@@ -389,29 +426,12 @@ setup_auditd() {
 # Make audit config immutable - requires reboot to change audit rules
 -e 2
 EOF
-
-  # Install auditd and setup rules
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Install auditd if needed
-    if ! command -v auditd >/dev/null 2>&1; then
-      apt-get update
-      apt-get install -y auditd audispd-plugins
-    fi
-    
-    # Back up audit rules
-    if [ -f /etc/audit/rules.d/audit.rules ]; then
-      cp /etc/audit/rules.d/audit.rules /root/security-backup/audit.rules.backup
-    fi
-    
-    # Prepare directory
-    mkdir -p /etc/audit/rules.d/
-  "
   
-  # Copy the rules file to the remote server
-  cat "$tmp_audit_rules" | ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "cat > /etc/audit/rules.d/audit.rules"
+  # Copy audit rules to the remote server
+  scp -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" "$tmp_audit_rules" root@$node_ip:/etc/audit/rules.d/audit.rules
   
   # Restart auditd
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "service auditd restart"
+  run_remote_command "$node_ip" "service auditd restart" "Restarting auditd" "Failed to restart auditd"
   
   # Remove temporary file
   rm -f "$tmp_audit_rules"
@@ -423,22 +443,15 @@ secure_root_account() {
   local node_ip=$1
   log "Securing root account on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Set strong password policies
-    if command -v pwquality >/dev/null 2>&1; then
-      # Backup first
-      cp /etc/security/pwquality.conf /root/security-backup/pwquality.conf.backup
-      
-      # Set strong password policies
-      sed -i 's/# minlen = 8/minlen = 14/' /etc/security/pwquality.conf
-      sed -i 's/# dcredit = 0/dcredit = -1/' /etc/security/pwquality.conf 
-      sed -i 's/# ucredit = 0/ucredit = -1/' /etc/security/pwquality.conf
-      sed -i 's/# ocredit = 0/ocredit = -1/' /etc/security/pwquality.conf
-      sed -i 's/# lcredit = 0/lcredit = -1/' /etc/security/pwquality.conf
-    fi
-    
-    echo 'Root account secured'
-  "
+  # Check if password quality tools are installed
+  run_remote_command "$node_ip" "command -v pwquality >/dev/null 2>&1 && { \
+    [ -f /etc/security/pwquality.conf ] && cp /etc/security/pwquality.conf /root/security-backup/pwquality.conf.backup || true; \
+    sed -i 's/# minlen = 8/minlen = 14/' /etc/security/pwquality.conf; \
+    sed -i 's/# dcredit = 0/dcredit = -1/' /etc/security/pwquality.conf; \
+    sed -i 's/# ucredit = 0/ucredit = -1/' /etc/security/pwquality.conf; \
+    sed -i 's/# ocredit = 0/ocredit = -1/' /etc/security/pwquality.conf; \
+    sed -i 's/# lcredit = 0/lcredit = -1/' /etc/security/pwquality.conf; \
+  } || true" "Setting password policies" "Failed to set password policies"
   
   log_success "Root account secured on $node_ip"
 }
@@ -446,6 +459,9 @@ secure_root_account() {
 install_fail2ban() {
   local node_ip=$1
   log "Installing and configuring Fail2ban on $node_ip..."
+  
+  # Install fail2ban
+  run_remote_command "$node_ip" "apt-get update && apt-get install -y fail2ban" "Installing fail2ban" "Failed to install fail2ban"
   
   # Create temporary file for fail2ban config
   local tmp_fail2ban=$(mktemp)
@@ -462,22 +478,15 @@ filter = sshd
 logpath = /var/log/auth.log
 maxretry = 3
 EOF
-
-  # Install and setup fail2ban
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Install fail2ban
-    apt-get update
-    apt-get install -y fail2ban
-    
-    # Create directory if needed
-    mkdir -p /etc/fail2ban
-  "
   
-  # Copy the fail2ban config to the remote server
-  cat "$tmp_fail2ban" | ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "cat > /etc/fail2ban/jail.local"
+  # Create directory and copy configuration
+  run_remote_command "$node_ip" "mkdir -p /etc/fail2ban" "Creating fail2ban directory" "Failed to create fail2ban directory"
   
-  # Enable and start fail2ban
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "systemctl enable fail2ban && systemctl restart fail2ban"
+  # Copy fail2ban config to the remote server
+  scp -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" "$tmp_fail2ban" root@$node_ip:/etc/fail2ban/jail.local
+  
+  # Enable and restart fail2ban
+  run_remote_command "$node_ip" "systemctl enable fail2ban && systemctl restart fail2ban" "Configuring fail2ban service" "Failed to configure fail2ban service"
   
   # Remove temporary file
   rm -f "$tmp_fail2ban"
@@ -489,43 +498,27 @@ secure_containerd() {
   local node_ip=$1
   log "Securing containerd runtime on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Backup containerd config
-    if [ -f /etc/containerd/config.toml ]; then
-      cp /etc/containerd/config.toml /root/security-backup/config.toml.backup
-    fi
-    
-    # Generate default config if it doesn't exist
-    if [ ! -f /etc/containerd/config.toml ]; then
-      containerd config default > /etc/containerd/config.toml
-    fi
-    
-    # Update containerd configuration for security
-    
-    # Ensure we have a version with no_new_privileges support
-    if grep -q 'SystemdCgroup' /etc/containerd/config.toml; then
-      # Enable systemd cgroup driver
-      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-      
-      # Set no_new_privileges for default runtime
-      if ! grep -q 'no_new_privileges' /etc/containerd/config.toml; then
-        sed -i '/\[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options\]/a \        NoNewPrivileges = true' /etc/containerd/config.toml
-      fi
-    else
-      # Older format or custom config - be more careful
-      echo 'Containerd config does not match expected format. Manual review recommended.'
-    fi
-    
-    # Restrict permissions on containerd socket
-    if [ -S /run/containerd/containerd.sock ]; then
-      chmod 0600 /run/containerd/containerd.sock
-    fi
-    
-    # Restart containerd
-    systemctl restart containerd
-    
-    echo 'Containerd security enhanced'
-  "
+  # Backup containerd config if it exists
+  run_remote_command "$node_ip" "[ -f /etc/containerd/config.toml ] && cp /etc/containerd/config.toml /root/security-backup/config.toml.backup || true" "Backing up containerd config" "Failed to backup containerd config"
+  
+  # Generate default config if it doesn't exist
+  run_remote_command "$node_ip" "[ ! -f /etc/containerd/config.toml ] && containerd config default > /etc/containerd/config.toml || true" "Creating default containerd config" "Failed to create containerd config"
+  
+  # Update containerd configuration for security
+  run_remote_command "$node_ip" "if grep -q 'SystemdCgroup' /etc/containerd/config.toml; then \
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; \
+    if ! grep -q 'no_new_privileges' /etc/containerd/config.toml; then \
+      sed -i '/\\[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options\\]/a \        NoNewPrivileges = true' /etc/containerd/config.toml; \
+    fi; \
+  else \
+    echo 'Containerd config does not match expected format. Manual review recommended.'; \
+  fi" "Configuring containerd security options" "Failed to configure containerd"
+  
+  # Restrict socket permissions if it exists
+  run_remote_command "$node_ip" "[ -S /run/containerd/containerd.sock ] && chmod 0600 /run/containerd/containerd.sock || true" "Setting containerd socket permissions" "Failed to set containerd socket permissions"
+  
+  # Restart containerd
+  run_remote_command "$node_ip" "systemctl restart containerd" "Restarting containerd" "Failed to restart containerd"
   
   log_success "Containerd secured on $node_ip"
 }
@@ -534,19 +527,14 @@ update_system() {
   local node_ip=$1
   log "Updating system packages on $node_ip..."
   
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip bash -c "
-    # Update package lists
-    apt-get update
-    
-    # Upgrade packages
-    DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=\"--force-confdef\" -o Dpkg::Options::=\"--force-confold\" upgrade -y
-    
-    # Clean up
-    apt-get autoremove -y
-    apt-get autoclean
-    
-    echo 'System packages updated successfully'
-  "
+  # Update package lists
+  run_remote_command "$node_ip" "apt-get update" "Updating package lists" "Failed to update package lists"
+  
+  # Upgrade packages with non-interactive defaults
+  run_remote_command "$node_ip" "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=\"--force-confdef\" -o Dpkg::Options::=\"--force-confold\" upgrade -y" "Upgrading packages" "Failed to upgrade packages"
+  
+  # Clean up
+  run_remote_command "$node_ip" "apt-get autoremove -y && apt-get autoclean" "Cleaning up package cache" "Failed to clean up package cache"
   
   log_success "System packages updated on $node_ip"
 }
@@ -585,7 +573,12 @@ verify_node_health() {
   
   # Check if kubelet is running
   local node_ip=$(grep $node $INVENTORY_PATH | grep -oP 'ansible_host=\K[^ ]+')
-  ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip systemctl is-active kubelet
+  local kubelet_status=$(ssh -o StrictHostKeyChecking=no -i "$ROOT_SSH_KEY" root@$node_ip "systemctl is-active kubelet")
+  
+  if [ "$kubelet_status" != "active" ]; then
+    log_error "Kubelet is not active on node ${node}"
+    return 1
+  fi
   
   log_success "Node ${node} is healthy"
   return 0
